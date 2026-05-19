@@ -6,6 +6,9 @@ Scraper em Python para coletar todos os produtos de `https://www.spotgifts.com.b
 - descrição
 - imagens
 - categorias
+- referência/código (quando disponível)
+
+Início da coleta: `https://www.spotgifts.com.br/pt/catalogo/?catalogo=1`
 
 ## Instalação
 
@@ -37,6 +40,7 @@ Cada item no JSON contém:
   "nome": "Nome do produto",
   "descricao": "Descrição do produto",
   "imagens": ["https://..."],
-  "categorias": ["Categoria A", "Categoria B"]
+  "categorias": ["Categoria A", "Categoria B"],
+  "referencia": "ABC-123"
 }
 ```
