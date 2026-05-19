@@ -14,6 +14,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import time
@@ -24,11 +25,9 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from xml.etree import ElementTree as ET
 
 BASE_URL = "https://www.spotgifts.com.br/pt/"
 CATALOGO_URL = "https://www.spotgifts.com.br/pt/catalogo/?catalogo=1"
-SITEMAP_URL = urljoin(BASE_URL, "sitemap.xml")
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -60,66 +59,11 @@ class SpotGiftsScraper:
         return resp
 
     def listar_urls_produtos(self) -> list[str]:
-        """Descobre URLs reais de produtos começando pelo catálogo."""
+        """Descobre URLs reais de produtos começando exclusivamente pelo catálogo."""
         print(f"[info] Iniciando descoberta a partir do catálogo: {CATALOGO_URL}")
         urls = self._listar_urls_catalogo()
         print(f"[info] URLs de produto encontradas no catálogo: {len(urls)}")
         return urls
-
-    def _listar_urls_produtos_sitemap(self) -> list[str]:
-        resp = self._get(SITEMAP_URL)
-        root = ET.fromstring(resp.content)
-
-        ns_match = re.match(r"\{(.+)\}", root.tag)
-        ns = {"sm": ns_match.group(1)} if ns_match else {}
-
-        sitemap_tags = root.findall("sm:sitemap", ns) if ns else root.findall("sitemap")
-
-        urls: set[str] = set()
-
-        # Se for sitemapindex, varre sitemaps filhos.
-        if sitemap_tags:
-            loc_tag = "sm:loc" if ns else "loc"
-            for sitemap in sitemap_tags:
-                loc = sitemap.findtext(loc_tag, default="", namespaces=ns)
-                if not loc:
-                    continue
-                if "product" in loc.lower() or "produto" in loc.lower() or "post" in loc.lower():
-                    urls.update(self._extrair_urls_de_sitemap(loc))
-            # fallback: se nada encontrado, varrer todos os sitemaps filhos
-            if not urls:
-                for sitemap in sitemap_tags:
-                    loc = sitemap.findtext(loc_tag, default="", namespaces=ns)
-                    if loc:
-                        urls.update(self._extrair_urls_de_sitemap(loc))
-        else:
-            urls.update(self._extrair_urls_de_sitemap(SITEMAP_URL))
-
-        return sorted(u for u in urls if self._parece_url_produto(u))
-
-    def _extrair_urls_de_sitemap(self, sitemap_url: str) -> set[str]:
-        resp = self._get(sitemap_url)
-        root = ET.fromstring(resp.content)
-        ns_match = re.match(r"\{(.+)\}", root.tag)
-        ns = {"sm": ns_match.group(1)} if ns_match else {}
-
-        locs: set[str] = set()
-        if root.tag.endswith("urlset"):
-            url_tags = root.findall("sm:url", ns) if ns else root.findall("url")
-            loc_tag = "sm:loc" if ns else "loc"
-            for url_node in url_tags:
-                loc = url_node.findtext(loc_tag, default="", namespaces=ns)
-                if loc:
-                    locs.add(loc.strip())
-        elif root.tag.endswith("sitemapindex"):
-            sitemaps = root.findall("sm:sitemap", ns) if ns else root.findall("sitemap")
-            loc_tag = "sm:loc" if ns else "loc"
-            for sm in sitemaps:
-                loc = sm.findtext(loc_tag, default="", namespaces=ns)
-                if loc:
-                    locs.update(self._extrair_urls_de_sitemap(loc.strip()))
-
-        return locs
 
     def _parece_url_produto(self, url: str) -> bool:
         u = url.lower()
@@ -161,6 +105,13 @@ class SpotGiftsScraper:
             "/termos",
             "/privacidade",
             "/faq",
+            "/ferramentas-de-marketing",
+            "/historia",
+            "/noticias",
+            "/perguntas-frequentes",
+            "/personalizacao",
+            "/sticker",
+            "/suco-brazil",
         ]
         return any(token in lower_url for token in blocked_tokens)
 
@@ -170,7 +121,7 @@ class SpotGiftsScraper:
         seen_pages: set[str] = set()
         product_urls: set[str] = set()
         filtered_urls = 0
-        category_hints = ("categoria", "category", "colecao", "catalog", "produtos", "loja", "shop", "catalogo")
+        total_raw_links = 0
 
         while to_visit:
             page_url = to_visit.popleft()
@@ -185,47 +136,88 @@ class SpotGiftsScraper:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
-            for a in soup.select("a[href]"):
-                href = a.get("href", "").strip()
-                if not href:
-                    continue
-                url = urljoin(BASE_URL, href)
+            links = self._coletar_links_relevantes_da_pagina(soup, page_url)
+            print(f"[debug] Links encontrados na página antes do filtro: {len(links)}")
+            total_raw_links += len(links)
+
+            for url in links:
                 url_lower = url.lower()
                 if self._url_bloqueada(url_lower):
                     filtered_urls += 1
                     continue
                 if self._parece_url_produto(url):
                     product_urls.add(url.rstrip("/"))
-                elif "/pt/" in url and any(k in url_lower for k in category_hints):
-                    if url not in seen_pages and url not in to_visit:
-                        to_visit.append(url)
                 elif any(k in url_lower for k in ("?paged=", "&paged=", "/page/")):
                     if url not in seen_pages and url not in to_visit:
                         to_visit.append(url)
 
-            # Busca URLs em scripts (sites com carregamento dinâmico/JS).
-            for script in soup.select("script"):
-                raw = script.string or script.get_text(" ", strip=False)
-                if not raw:
-                    continue
-                for match in re.findall(r'https://www\\.spotgifts\\.com\\.br/pt/[a-zA-Z0-9\\-_/]+', raw):
-                    if self._url_bloqueada(match.lower()):
-                        filtered_urls += 1
-                        continue
-                    if self._parece_url_produto(match):
-                        product_urls.add(match.rstrip("/"))
-                for match in re.findall(r'"/pt/[a-zA-Z0-9\\-_/]+"' , raw):
-                    url = urljoin(BASE_URL, match.strip('"'))
-                    if self._url_bloqueada(url.lower()):
-                        filtered_urls += 1
-                        continue
-                    if self._parece_url_produto(url):
-                        product_urls.add(url.rstrip("/"))
+            ajax_urls = self._detectar_endpoints_ajax(soup, page_url)
+            if ajax_urls:
+                print(f"[debug] Possíveis endpoints AJAX/API detectados: {len(ajax_urls)}")
+                for endpoint in ajax_urls:
+                    print(f"[debug] Endpoint: {endpoint}")
 
             time.sleep(self.delay)
 
+        if not product_urls:
+            with open("debug_catalogo.html", "w", encoding="utf-8") as f:
+                f.write(resp.text)
+            print("[aviso] Nenhum produto encontrado no HTML. Arquivo debug_catalogo.html salvo.")
+
+        print(f"[info] Total de links brutos encontrados no catálogo: {total_raw_links}")
         print(f"[info] URLs ignoradas por filtro institucional: {filtered_urls}")
         return sorted(product_urls)
+
+    def _coletar_links_relevantes_da_pagina(self, soup: BeautifulSoup, page_url: str) -> list[str]:
+        links: list[str] = []
+        seen: set[str] = set()
+
+        # foco na grade/listagem de catálogo
+        selectors = [
+            ".products a[href]",
+            ".product a[href]",
+            ".catalogo a[href]",
+            ".grid a[href]",
+            "main a[href]",
+        ]
+        for sel in selectors:
+            for a in soup.select(sel):
+                href = (a.get("href") or "").strip()
+                if not href:
+                    continue
+                url = urljoin(BASE_URL, href).rstrip("/")
+                if "/pt/" not in url.lower():
+                    continue
+                if url not in seen:
+                    seen.add(url)
+                    links.append(url)
+
+        # inclui links vindos de scripts (quando catálogo é renderizado por JS)
+        script_text = " ".join(s.get_text(" ", strip=False) for s in soup.select("script"))
+        script_text = html.unescape(script_text)
+        for match in re.findall(r"https://www\.spotgifts\.com\.br/pt/[a-zA-Z0-9\-_/?.=&]+", script_text):
+            url = match.rstrip("/")
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+        for match in re.findall(r"\"(/pt/[a-zA-Z0-9\-_/?.=&]+)\"", script_text):
+            url = urljoin(BASE_URL, match).rstrip("/")
+            if url not in seen:
+                seen.add(url)
+                links.append(url)
+        return links
+
+    def _detectar_endpoints_ajax(self, soup: BeautifulSoup, page_url: str) -> list[str]:
+        candidates: set[str] = set()
+        for script in soup.select("script"):
+            raw = script.get_text(" ", strip=False) or ""
+            for m in re.findall(r"https?://[^\s\"']+", raw):
+                ml = m.lower()
+                if any(k in ml for k in ("admin-ajax", "/wp-json/", "/api/", "graphql")):
+                    candidates.add(m.strip().rstrip(",;"))
+            for m in re.findall(r"['\"](/[^'\"]*(?:admin-ajax|wp-json|api)[^'\"]*)['\"]", raw):
+                candidates.add(urljoin(page_url, m))
+        return sorted(candidates)
 
     def extrair_produto(self, url: str) -> Produto:
         resp = self._get(url)
