@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 from xml.etree import ElementTree as ET
 
 BASE_URL = "https://www.spotgifts.com.br/pt/"
+CATALOGO_URL = "https://www.spotgifts.com.br/pt/catalogo/?catalogo=1"
 SITEMAP_URL = urljoin(BASE_URL, "sitemap.xml")
 HEADERS = {
     "User-Agent": (
@@ -43,6 +44,7 @@ class Produto:
     descricao: str | None
     imagens: list[str]
     categorias: list[str]
+    referencia: str | None
 
 
 class SpotGiftsScraper:
@@ -58,18 +60,10 @@ class SpotGiftsScraper:
         return resp
 
     def listar_urls_produtos(self) -> list[str]:
-        """Descobre URLs de produtos via sitemap e crawler de categorias/site."""
-        print("[info] Iniciando descoberta de URLs de produtos")
-        try:
-            product_urls = self._listar_urls_produtos_sitemap()
-            if product_urls:
-                print(f"[info] URLs encontradas via sitemap: {len(product_urls)}")
-                return product_urls
-        except Exception as exc:
-            print(f"[aviso] Falha no sitemap: {exc}")
-
-        urls = self._listar_urls_produtos_fallback()
-        print(f"[info] URLs encontradas via crawler: {len(urls)}")
+        """Descobre URLs reais de produtos começando pelo catálogo."""
+        print(f"[info] Iniciando descoberta a partir do catálogo: {CATALOGO_URL}")
+        urls = self._listar_urls_catalogo()
+        print(f"[info] URLs de produto encontradas no catálogo: {len(urls)}")
         return urls
 
     def _listar_urls_produtos_sitemap(self) -> list[str]:
@@ -129,6 +123,8 @@ class SpotGiftsScraper:
 
     def _parece_url_produto(self, url: str) -> bool:
         u = url.lower()
+        if self._url_bloqueada(u):
+            return False
         if any(
             token in u
             for token in ["/pt/produto", "/pt/product", "/produto/", "/product/", "?product="]
@@ -138,7 +134,7 @@ class SpotGiftsScraper:
         if not path.startswith("https://www.spotgifts.com.br/pt/"):
             return False
         # Muitos catálogos usam slug direto no /pt/<slug>, sem /product/.
-        blocked = ("/pt/", "/pt/categoria", "/pt/category", "/pt/contact", "/pt/sobre", "/pt/home")
+        blocked = ("/pt/", "/pt/categoria", "/pt/category", "/pt/contact", "/pt/sobre", "/pt/home", "/pt/catalogo")
         if path in blocked:
             return False
         pieces = [p for p in path.replace("https://www.spotgifts.com.br", "").split("/") if p]
@@ -152,20 +148,36 @@ class SpotGiftsScraper:
             "institucional",
         }
 
-    def _listar_urls_produtos_fallback(self) -> list[str]:
-        """Navega categorias/listagens, coleta links e também URLs em scripts inline."""
-        print("[info] Usando crawler de navegação para descobrir produtos")
-        to_visit = deque([BASE_URL])
+    def _url_bloqueada(self, lower_url: str) -> bool:
+        blocked_tokens = [
+            "/clientes",
+            "/valores",
+            "/contact",
+            "/contato",
+            "/sobre",
+            "/blog",
+            "/institucional",
+            "/politica",
+            "/termos",
+            "/privacidade",
+            "/faq",
+        ]
+        return any(token in lower_url for token in blocked_tokens)
+
+    def _listar_urls_catalogo(self) -> list[str]:
+        """Navega catálogo e paginação, coletando apenas produtos reais."""
+        to_visit = deque([CATALOGO_URL])
         seen_pages: set[str] = set()
         product_urls: set[str] = set()
-        category_hints = ("categoria", "category", "colecao", "catalog", "produtos", "loja", "shop")
+        filtered_urls = 0
+        category_hints = ("categoria", "category", "colecao", "catalog", "produtos", "loja", "shop", "catalogo")
 
         while to_visit:
             page_url = to_visit.popleft()
             if page_url in seen_pages:
                 continue
             seen_pages.add(page_url)
-            print(f"[crawl] Processando página: {page_url}")
+            print(f"[crawl] Processando página de catálogo/listagem: {page_url}")
 
             try:
                 resp = self._get(page_url)
@@ -178,10 +190,17 @@ class SpotGiftsScraper:
                 if not href:
                     continue
                 url = urljoin(BASE_URL, href)
+                url_lower = url.lower()
+                if self._url_bloqueada(url_lower):
+                    filtered_urls += 1
+                    continue
                 if self._parece_url_produto(url):
-                    product_urls.add(url)
-                elif "/pt/" in url and any(k in url.lower() for k in category_hints):
-                    if url not in seen_pages:
+                    product_urls.add(url.rstrip("/"))
+                elif "/pt/" in url and any(k in url_lower for k in category_hints):
+                    if url not in seen_pages and url not in to_visit:
+                        to_visit.append(url)
+                elif any(k in url_lower for k in ("?paged=", "&paged=", "/page/")):
+                    if url not in seen_pages and url not in to_visit:
                         to_visit.append(url)
 
             # Busca URLs em scripts (sites com carregamento dinâmico/JS).
@@ -190,15 +209,22 @@ class SpotGiftsScraper:
                 if not raw:
                     continue
                 for match in re.findall(r'https://www\\.spotgifts\\.com\\.br/pt/[a-zA-Z0-9\\-_/]+', raw):
+                    if self._url_bloqueada(match.lower()):
+                        filtered_urls += 1
+                        continue
                     if self._parece_url_produto(match):
                         product_urls.add(match.rstrip("/"))
                 for match in re.findall(r'"/pt/[a-zA-Z0-9\\-_/]+"' , raw):
                     url = urljoin(BASE_URL, match.strip('"'))
+                    if self._url_bloqueada(url.lower()):
+                        filtered_urls += 1
+                        continue
                     if self._parece_url_produto(url):
                         product_urls.add(url.rstrip("/"))
 
             time.sleep(self.delay)
 
+        print(f"[info] URLs ignoradas por filtro institucional: {filtered_urls}")
         return sorted(product_urls)
 
     def extrair_produto(self, url: str) -> Produto:
@@ -209,6 +235,7 @@ class SpotGiftsScraper:
         descricao = self._extrair_descricao(soup)
         imagens = self._extrair_imagens(soup, url)
         categorias = self._extrair_categorias(soup)
+        referencia = self._extrair_referencia(soup)
 
         return Produto(
             url=url,
@@ -216,6 +243,7 @@ class SpotGiftsScraper:
             descricao=descricao,
             imagens=imagens,
             categorias=categorias,
+            referencia=referencia,
         )
 
     def _extrair_nome(self, soup: BeautifulSoup) -> str | None:
@@ -326,6 +354,26 @@ class SpotGiftsScraper:
             for item in data:
                 yield from self._coletar_categorias_jsonld(item)
 
+    def _extrair_referencia(self, soup: BeautifulSoup) -> str | None:
+        selectors = [
+            ".sku",
+            "[itemprop='sku']",
+            ".product-reference",
+            ".product_ref",
+        ]
+        for sel in selectors:
+            node = soup.select_one(sel)
+            if node:
+                text = self._clean(node.get_text(" ", strip=True))
+                if text:
+                    return text
+
+        text_full = self._clean(soup.get_text(" ", strip=True))
+        m = re.search(r"(?:refer[eê]ncia|ref\\.?|c[oó]digo|sku)\\s*[:#-]\\s*([A-Z0-9\\-_.]+)", text_full, re.I)
+        if m:
+            return m.group(1).strip()
+        return None
+
     @staticmethod
     def _clean(text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
@@ -359,6 +407,7 @@ def main() -> None:
                             descricao=item.get("descricao"),
                             imagens=item.get("imagens") or [],
                             categorias=item.get("categorias") or [],
+                            referencia=item.get("referencia"),
                         )
                     )
             print(f"[info] Modo resume: {len(processadas)} produtos já existentes em {args.output}")
@@ -374,6 +423,9 @@ def main() -> None:
         try:
             print(f"[produto] Extraindo: {url}")
             produto = scraper.extrair_produto(url)
+            if not produto.descricao:
+                print(f"[{i}/{len(urls)}] SKIP sem descrição: {url}")
+                continue
             produtos.append(produto)
             print(f"[{i}/{len(urls)}] OK: {produto.nome or url}")
         except Exception as exc:
