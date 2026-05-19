@@ -17,19 +17,13 @@ import argparse
 import json
 import re
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Iterable
 from urllib.parse import urljoin
 
-try:
-    import requests
-    from bs4 import BeautifulSoup
-except ModuleNotFoundError as exc:
-    raise SystemExit(
-        "Dependências ausentes. Instale com:\n"
-        "  pip install -r requirements.txt\n"
-        f"Erro original: {exc}"
-    ) from exc
+import requests
+from bs4 import BeautifulSoup
 from xml.etree import ElementTree as ET
 
 BASE_URL = "https://www.spotgifts.com.br/pt/"
@@ -64,15 +58,19 @@ class SpotGiftsScraper:
         return resp
 
     def listar_urls_produtos(self) -> list[str]:
-        """Descobre URLs de produtos via sitemap (com fallback para lista de produtos)."""
+        """Descobre URLs de produtos via sitemap e crawler de categorias/site."""
+        print("[info] Iniciando descoberta de URLs de produtos")
         try:
             product_urls = self._listar_urls_produtos_sitemap()
             if product_urls:
+                print(f"[info] URLs encontradas via sitemap: {len(product_urls)}")
                 return product_urls
         except Exception as exc:
             print(f"[aviso] Falha no sitemap: {exc}")
 
-        return self._listar_urls_produtos_fallback()
+        urls = self._listar_urls_produtos_fallback()
+        print(f"[info] URLs encontradas via crawler: {len(urls)}")
+        return urls
 
     def _listar_urls_produtos_sitemap(self) -> list[str]:
         resp = self._get(SITEMAP_URL)
@@ -131,23 +129,43 @@ class SpotGiftsScraper:
 
     def _parece_url_produto(self, url: str) -> bool:
         u = url.lower()
-        return any(
+        if any(
             token in u
             for token in ["/pt/produto", "/pt/product", "/produto/", "/product/", "?product="]
-        )
+        ):
+            return True
+        path = u.split("?", 1)[0].rstrip("/")
+        if not path.startswith("https://www.spotgifts.com.br/pt/"):
+            return False
+        # Muitos catálogos usam slug direto no /pt/<slug>, sem /product/.
+        blocked = ("/pt/", "/pt/categoria", "/pt/category", "/pt/contact", "/pt/sobre", "/pt/home")
+        if path in blocked:
+            return False
+        pieces = [p for p in path.replace("https://www.spotgifts.com.br", "").split("/") if p]
+        return len(pieces) >= 2 and pieces[0] == "pt" and pieces[1] not in {
+            "categoria",
+            "category",
+            "catalogo",
+            "catalog",
+            "contactos",
+            "contatos",
+            "institucional",
+        }
 
     def _listar_urls_produtos_fallback(self) -> list[str]:
-        """Fallback: navega em páginas de listagem e coleta links com padrão de produto."""
-        print("[info] Usando fallback de crawling em páginas de listagem")
-        to_visit = [BASE_URL]
+        """Navega categorias/listagens, coleta links e também URLs em scripts inline."""
+        print("[info] Usando crawler de navegação para descobrir produtos")
+        to_visit = deque([BASE_URL])
         seen_pages: set[str] = set()
         product_urls: set[str] = set()
+        category_hints = ("categoria", "category", "colecao", "catalog", "produtos", "loja", "shop")
 
         while to_visit:
-            page_url = to_visit.pop(0)
+            page_url = to_visit.popleft()
             if page_url in seen_pages:
                 continue
             seen_pages.add(page_url)
+            print(f"[crawl] Processando página: {page_url}")
 
             try:
                 resp = self._get(page_url)
@@ -162,9 +180,22 @@ class SpotGiftsScraper:
                 url = urljoin(BASE_URL, href)
                 if self._parece_url_produto(url):
                     product_urls.add(url)
-                elif "/pt/" in url and any(k in url.lower() for k in ["categoria", "category", "colecao", "catalog"]):
-                    if url not in seen_pages and url not in to_visit:
+                elif "/pt/" in url and any(k in url.lower() for k in category_hints):
+                    if url not in seen_pages:
                         to_visit.append(url)
+
+            # Busca URLs em scripts (sites com carregamento dinâmico/JS).
+            for script in soup.select("script"):
+                raw = script.string or script.get_text(" ", strip=False)
+                if not raw:
+                    continue
+                for match in re.findall(r'https://www\\.spotgifts\\.com\\.br/pt/[a-zA-Z0-9\\-_/]+', raw):
+                    if self._parece_url_produto(match):
+                        product_urls.add(match.rstrip("/"))
+                for match in re.findall(r'"/pt/[a-zA-Z0-9\\-_/]+"' , raw):
+                    url = urljoin(BASE_URL, match.strip('"'))
+                    if self._parece_url_produto(url):
+                        product_urls.add(url.rstrip("/"))
 
             time.sleep(self.delay)
 
@@ -341,6 +372,7 @@ def main() -> None:
             print(f"[{i}/{len(urls)}] SKIP (resume): {url}")
             continue
         try:
+            print(f"[produto] Extraindo: {url}")
             produto = scraper.extrair_produto(url)
             produtos.append(produto)
             print(f"[{i}/{len(urls)}] OK: {produto.nome or url}")
@@ -351,6 +383,7 @@ def main() -> None:
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump([asdict(p) for p in produtos], f, ensure_ascii=False, indent=2)
 
+    print(f"[ok] Produtos extraídos: {len(produtos)}")
     print(f"[ok] {len(produtos)} produtos salvos em {args.output}")
 
 
