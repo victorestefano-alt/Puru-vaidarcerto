@@ -1,14 +1,25 @@
-# Scraper Spot Gifts
+# Scraper Spot Gifts (Playwright)
 
-Scraper em Python para coletar todos os produtos de `https://www.spotgifts.com.br/pt/` com:
+Scraper em Python para catálogo dinâmico da Spot Gifts, renderizando JavaScript antes da extração.
 
+URL de entrada fixa:
+- `https://www.spotgifts.com.br/pt/catalogo/?catalogo=1`
+
+## O que extrai
 - nome
+- url
 - descrição
 - imagens
 - categorias
-- referência/código (quando disponível)
+- referência/código (se disponível)
 
-Início da coleta: `https://www.spotgifts.com.br/pt/catalogo/?catalogo=1`
+## Regras
+- ignora páginas institucionais (clientes, valores, contato, sobre, blog etc.)
+- salva apenas itens válidos com:
+  - nome
+  - URL real de produto
+  - descrição
+  - ao menos 1 imagem
 
 ## Instalação
 
@@ -16,6 +27,13 @@ Início da coleta: `https://www.spotgifts.com.br/pt/catalogo/?catalogo=1`
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+> Se estiver em servidor Linux, pode ser necessário:
+
+```bash
+python -m playwright install-deps chromium
 ```
 
 ## Execução
@@ -25,22 +43,31 @@ python scraper_spotgifts.py --output produtos_spotgifts.json
 ```
 
 Parâmetros:
-- `--output`: arquivo JSON de saída (default: `produtos_spotgifts.json`)
-- `--delay`: delay entre requests em segundos (default: `0.2`)
-- `--limit`: limita a quantidade de produtos processados (default: `0`, sem limite)
-- `--resume`: continua uma coleta anterior lendo o arquivo de saída e pulando URLs já processadas
+- `--output`: arquivo de saída JSON (default: `produtos_spotgifts.json`)
+- `--delay-ms`: espera entre ciclos de carregamento dinâmico (default: `1500`)
+- `--max-scrolls`: máximo de ciclos de scroll/paginação (default: `30`)
+- `--headed`: abre o navegador visível (debug)
 
-## Estrutura do output
+## Logs esperados
+- tempo de abertura da página de catálogo
+- quantidade de links brutos por ciclo
+- quantidade de produtos detectados por ciclo
+- total acumulado de produtos
+- tempo por produto extraído
+- tempo total da execução
 
-Cada item no JSON contém:
+Se nenhum produto for detectado, o scraper salva:
+- `debug_catalogo.html`
+
+## Saída JSON
 
 ```json
 {
-  "url": "https://...",
   "nome": "Nome do produto",
-  "descricao": "Descrição do produto",
+  "url": "https://www.spotgifts.com.br/pt/...",
+  "descricao": "Descrição",
   "imagens": ["https://..."],
-  "categorias": ["Categoria A", "Categoria B"],
-  "referencia": "ABC-123"
+  "categorias": ["Categoria"],
+  "referencia": "REF-123"
 }
 ```
